@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Notebook
+.ipynb_checkpoints/
+
+# IDE / 编辑器
+.idea/
+.vscode/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 环境变量与密钥
+.env
+.env.*
+
+# 数据与输出（体积较大，不纳入版本管理）
+data/
+outputs/
+*.nii
+*.nii.gz
+*.edf
+*.bdf
+*.fif
+*.zip
