@@ -7,6 +7,7 @@ grouped splits of that outer fold's training subjects.
 from __future__ import annotations
 
 import json
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -128,6 +129,20 @@ def _vector_groups(columns):
     return groups
 
 
+def _report_vector_widths(feature_set, columns, column_groups, width):
+    """打印每个特征组的 原始宽度 → 输出宽度，便于核对等宽改造。"""
+    print(f"[vector widths] feature_set={feature_set}  common width d={width}", flush=True)
+    total = 0
+    for name, indices in column_groups:
+        raw = len(indices)
+        components = min(width, raw) if raw > width else raw
+        pad = max(0, width - raw) if raw < width else 0
+        total += width
+        print(f"  {name:20s} raw={raw:4d} -> out={width:3d}  (PCA={components:3d}, pad={pad:2d})",
+              flush=True)
+    print(f"  concatenated width = {total}", flush=True)
+
+
 class _GroupProjector(BaseEstimator, TransformerMixin):
     """把一个特征组投影到共同宽度；样本或特征不足时保持原宽度。"""
 
@@ -150,7 +165,7 @@ class _GroupProjector(BaseEstimator, TransformerMixin):
         return self.pca_.transform(X)
 
 
-def _group_scaler(column_groups, project_width=None):
+def _group_scaler(column_groups, project_width=None, equal_width=False):
     """Per-modality imputation and scaling; every fit stays inside the fold."""
     branches = []
     for name, indices in column_groups:
@@ -159,9 +174,45 @@ def _group_scaler(column_groups, project_width=None):
             ("scaler", StandardScaler()),
         ]
         if project_width:
-            steps.append(("project", _GroupProjector(project_width)))
+            projector = (_EqualWidthProjector(project_width) if equal_width
+                         else _GroupProjector(project_width))
+            steps.append(("project", projector))
         branches.append((name, Pipeline(steps), list(indices)))
     return ColumnTransformer(branches, remainder="drop", sparse_threshold=0.0)
+
+
+class _EqualWidthProjector(BaseEstimator, TransformerMixin):
+    """投影到固定的 common width：宽了用 PCA，窄了零填充。
+
+    零填充列在后续 VarianceThreshold 前方差为 0，会被剔除；即使不剔除也不
+    对 PCA 子空间产生贡献。因此等宽改造不应改变任何指标。
+    """
+
+    def __init__(self, width=16):
+        self.width = width
+
+    def fit(self, X, y=None):
+        X = np.asarray(X, dtype=float)
+        self.pca_ = None
+        self.n_components_ = 0
+        if X.shape[1] > int(self.width):
+            limit = min(int(self.width), max(1, X.shape[0] - 1), X.shape[1])
+            self.n_components_ = int(limit)
+            # 全常数输入会让 PCA 的方差比为 0/0；变换本身仍然有效，只静音该提示。
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                self.pca_ = PCA(n_components=self.n_components_, svd_solver="full").fit(X)
+            self.pad_ = int(self.width) - self.n_components_
+        else:
+            self.pad_ = int(self.width) - X.shape[1]
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=float)
+        out = self.pca_.transform(X) if self.pca_ is not None else X
+        if self.pad_ > 0:
+            out = np.pad(out, ((0, 0), (0, self.pad_)), mode="constant")
+        return out
 
 
 def _dummy_inputs(X):
@@ -169,7 +220,7 @@ def _dummy_inputs(X):
 
 
 def _pipeline(name, *, seed, transformer=None, pca_components=None,
-              column_groups=None, project_width=None):
+              column_groups=None, project_width=None, equal_width=False):
     classifier, grid = _model_spec(name, seed)
     steps = []
     if name == "dummy":
@@ -181,7 +232,7 @@ def _pipeline(name, *, seed, transformer=None, pca_components=None,
     elif column_groups:
         # 文档第 2 步的第 1 段：各模态分开标准化后再拼接，避免 822 维 EEG
         # 与 30 维生理在同一个尺度块里竞争。
-        steps.append(("modality_scaling", _group_scaler(column_groups, project_width)))
+        steps.append(("modality_scaling", _group_scaler(column_groups, project_width, equal_width)))
     steps.append(("imputer", SimpleImputer(strategy="median", keep_empty_features=True)))
     # The majority baseline must also work when every feature is constant.
     if name != "dummy":
@@ -263,11 +314,12 @@ def _validate_training_observations(X, feature_blocks):
 def _fit_training_only(X, y, groups, *, model, transformer, inner_splits,
                        seed, n_jobs, pca_components, model_grids,
                        feature_blocks=None, column_groups=None,
-                       grouped_inner=True, project_width=None):
+                       grouped_inner=True, project_width=None, equal_width=False):
     """Fit/tune using this training partition alone; no held-out inputs."""
     estimator, grid = _pipeline(
         model, seed=seed, transformer=transformer, pca_components=pca_components,
         column_groups=column_groups, project_width=project_width,
+        equal_width=equal_width,
     )
     if model_grids is not None and model in model_grids:
         grid = model_grids[model]
@@ -364,7 +416,7 @@ def _evaluate_backend(dataset, X, *, feature_set, models, inner_splits, seed,
                       n_jobs, transformer=None, pca_components=None,
                       threshold_grid=(0.5,), model_grids=None,
                       feature_blocks=None, column_groups=None, grouping="loso",
-                      project_width=None):
+                      project_width=None, equal_width=False):
     table, y, groups, names = _validate_evaluation(dataset, models, grouping=grouping)
     X = np.asarray(X, dtype=float)
     if X.shape[0] != len(table):
@@ -384,6 +436,7 @@ def _evaluate_backend(dataset, X, *, feature_set, models, inner_splits, seed,
                 n_jobs=n_jobs, pca_components=pca_components, model_grids=model_grids,
                 feature_blocks=feature_blocks, column_groups=column_groups,
                 grouped_inner=(grouping == "loso"), project_width=project_width,
+                equal_width=equal_width,
             )
             threshold = 0.5 if model == "dummy" else _select_threshold(
                 fitted, X[train], y[train], cv, threshold_grid
@@ -412,7 +465,8 @@ def evaluate_classical(dataset, *, models=("logreg", "hist_gb", "random_forest")
                        seed=2026, n_jobs=1, pca_components=None,
                        threshold_grid=(0.5,), model_grids=None,
                        grouping="loso", per_modality_scaling=False,
-                       vector_groups=False, vector_width=16):
+                       vector_groups=False, vector_width=16,
+                       equal_width=False):
     """Evaluate prespecified tabular feature sets using nested subject groups.
 
     Feature selection is delegated to data.feature_columns so acquisition/task
@@ -441,12 +495,15 @@ def evaluate_classical(dataset, *, models=("logreg", "hist_gb", "random_forest")
             column_groups, width = _feature_groups(columns), None
         else:
             column_groups, width = None, None
+        if equal_width and column_groups:
+            _report_vector_widths(feature_set, columns, column_groups, width)
         result = _evaluate_backend(
             dataset, X, feature_set=feature_set, models=models,
             inner_splits=inner_splits, seed=seed, n_jobs=n_jobs,
             pca_components=pca_components, threshold_grid=threshold_grid,
             model_grids=model_grids, feature_blocks=_feature_blocks(columns),
             column_groups=column_groups, grouping=grouping, project_width=width,
+            equal_width=equal_width,
         )
         result["selection"]["Columns"] = [columns] * len(result["selection"])
         results.append(result)

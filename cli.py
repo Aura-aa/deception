@@ -10,6 +10,8 @@ import sys
 from .data import audit_table, feature_columns, load_bundle, load_legacy_table, require_evaluable, save_bundle
 from .metrics import write_run
 
+_AGFL_CONFIG: dict = {}
+
 
 def _input_options(parser):
     parser.add_argument("--input", type=Path, required=True, help="Prepared bundle directory or original CSV for diagnostics.")
@@ -64,6 +66,23 @@ def build_parser():
                            help="Step 2 of the pipeline note: split EEG into 4 sub-windows x 4 bands and project each group.")
     benchmark.add_argument("--vector-width", type=int, default=16,
                            help="Common vector width for each feature group (default 16).")
+    benchmark.add_argument("--equal-width-vectors", action="store_true",
+                           help="Pad narrow groups (physiology) to the common width; EEG groups use PCA.")
+    agfl = commands.add_parser("agfl", help="AGFL layer comparison: none / k0 / intra / inter / combined.")
+    _input_options(agfl)
+    agfl.add_argument("--grouping", choices=["loso", "within"], default="within")
+    agfl.add_argument("--configs", nargs="+", default=["none", "k0", "intra", "inter", "combined"],
+                      choices=["none", "k0", "intra", "inter", "combined"])
+    agfl.add_argument("--seeds", nargs="+", type=int, default=[2026])
+    agfl.add_argument("--d", type=int, default=16)
+    agfl.add_argument("--a", type=int, default=16)
+    agfl.add_argument("--hops", type=int, default=2)
+    agfl.add_argument("--kappa", type=int, default=5)
+    agfl.add_argument("--epochs", type=int, default=60)
+    agfl.add_argument("--lr", type=float, default=1e-3)
+    agfl.add_argument("--weight-decay", type=float, default=1e-2)
+    agfl.add_argument("--shuffle-labels", action="store_true")
+    agfl.add_argument("--n-threads", type=int, default=4)
     spatial = commands.add_parser("spatial", help="CSP or xDAWN fitted independently in every training fold.")
     _input_options(spatial)
     _classical_options(spatial)
@@ -182,7 +201,27 @@ def run(args):
                                     grouping=args.grouping,
                                     per_modality_scaling=args.per_modality_scaling,
                                     vector_groups=args.vector_groups,
-                                    vector_width=args.vector_width)
+                                    vector_width=args.vector_width,
+                                    equal_width=args.equal_width_vectors)
+    elif args.command == "agfl":
+        from .torch_benchmark import evaluate_agfl
+        result = evaluate_agfl(data, grouping=args.grouping, configs=tuple(args.configs),
+                               seeds=tuple(args.seeds), d=args.d, a=args.a, hops=args.hops,
+                               kappa=args.kappa, epochs=args.epochs, lr=args.lr,
+                               weight_decay=args.weight_decay,
+                               shuffle_labels=args.shuffle_labels,
+                               fold_seed=args.seed, n_threads=args.n_threads)
+        args.output.mkdir(parents=True, exist_ok=True)
+        _AGFL_CONFIG.clear()
+        _AGFL_CONFIG.update({
+            "configs": list(args.configs), "seeds": list(args.seeds),
+            "d": args.d, "a": args.a, "hops": args.hops, "kappa": args.kappa,
+            "epochs": args.epochs, "lr": args.lr, "weight_decay": args.weight_decay,
+            "grouping": args.grouping, "fold_seed": args.seed,
+            "shuffle_labels": bool(args.shuffle_labels),
+            "encoder": "training-fold StandardScaler + PCA(d) for wide groups, zero padding for narrow groups",
+            "pca4": "0.95 fitted on training-fold encoder output; AGFL output uses the same basis",
+        })
     elif args.command == "spatial":
         from .evaluation import evaluate_spatial
         result = evaluate_spatial(data, representation=args.representation, models=tuple(args.models),
@@ -208,6 +247,10 @@ def run(args):
         raise ValueError("Unknown command.")
     configuration = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     write_run(result, data, args.output, configuration=configuration, run_status=status)
+    if _AGFL_CONFIG:
+        (args.output / "agfl_config.json").write_text(
+            json.dumps(_AGFL_CONFIG, indent=2, ensure_ascii=False), encoding="utf-8")
+        _AGFL_CONFIG.clear()
     print(f"Saved predictions, metrics, fold selections and run metadata: {args.output}")
 
 
