@@ -69,6 +69,8 @@ class AGFLLayer(nn.Module):
     def __init__(self, d: int = 16, a: int = 16, hops: int = 2,
                  kappa: int = 5, eps: float = 1e-6):
         super().__init__()
+        if d < 2:
+            raise ValueError("AGFL needs a node width of at least 2 because layer normalization of a single coordinate is constant.")
         if hops < 0:
             raise ValueError("hops must be non-negative.")
         self.d, self.a, self.hops, self.kappa, self.eps = int(d), int(a), int(hops), int(kappa), float(eps)
@@ -117,7 +119,12 @@ class FixedProjection(nn.Module):
 
 
 class AGFLModel(nn.Module):
-    """编码器输出 H → [intra] → [inter] → PCA 基 → Linear。"""
+    """Apply the requested graph to encoded nodes, then a fixed PCA and a linear head.
+
+    Intra exchanges messages within modality blocks. Inter uses all nodes, so
+    for EEG alone it connects different EEG time-window/band nodes. Combined
+    applies the within-block graph followed by the all-node graph.
+    """
 
     def __init__(self, config: str, sizes: list[int], d: int, a: int, hops: int,
                  kappa: int, pca_mean: torch.Tensor, pca_components: torch.Tensor):
@@ -126,15 +133,17 @@ class AGFLModel(nn.Module):
             raise ValueError(f"Unknown AGFL config {config!r}.")
         self.config = config
         self.sizes = list(sizes)
-        shared_hops = 0 if config == "k0" else hops
-        self.intra = (AGFLLayer(d, a, shared_hops, kappa)
+        if not self.sizes or any(size < 1 for size in self.sizes):
+            raise ValueError("Each modality block needs at least one node.")
+        # Draw the head before any configuration-specific graph parameters. The
+        # same seed and training PCA then give the same initial head in every arm.
+        self.projection = FixedProjection(pca_mean, pca_components)
+        self.head = nn.Linear(int(pca_components.shape[0]), 2)
+        self.intra = (AGFLLayer(d, a, hops, kappa)
                       if config in {"intra", "combined"} else None)
-        self.inter = (AGFLLayer(d, a, shared_hops, kappa)
+        self.inter = (AGFLLayer(d, a, hops, kappa)
                       if config in {"inter", "combined"} else None)
         self.k0 = AGFLLayer(d, a, 0, kappa) if config == "k0" else None
-        self.projection = FixedProjection(pca_mean, pca_components)
-        n_components = int(pca_components.shape[0])
-        self.head = nn.Linear(n_components, 2)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         if self.k0 is not None:
@@ -142,7 +151,11 @@ class AGFLModel(nn.Module):
         if self.intra is not None:
             blocks, start = [], 0
             for size in self.sizes:
-                blocks.append(self.intra(h[:, start:start + size], build_edge_mask(size)))
+                block = h[:, start:start + size]
+                # A singleton modality (e.g. one EMG node) has no intra edges.
+                if size > 1:
+                    block = self.intra(block, build_edge_mask(size))
+                blocks.append(block)
                 start += size
             h = torch.cat(blocks, dim=1)
         if self.inter is not None:

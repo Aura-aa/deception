@@ -15,7 +15,6 @@ from typing import Mapping, Sequence
 import numpy as np
 import pandas as pd
 from scipy.signal import welch
-from scipy.integrate import trapezoid
 
 from .data import TrialDataset, NONFEATURE_COLUMNS
 
@@ -54,20 +53,24 @@ def behavior_features(table: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def _band_masks(frequencies: np.ndarray, bands: Mapping[str, tuple[float, float]],
-                sfreq: float) -> dict[str, np.ndarray]:
-    masks = {}
+def _band_weights(n_samples: int, bands: Mapping[str, tuple[float, float]],
+                  sfreq: float) -> dict[str, np.ndarray]:
+    """Width in Hz of each one-sided Welch bin's overlap with each band."""
+    frequencies = np.fft.rfftfreq(n_samples, d=1. / sfreq)
+    half_bin = sfreq / (2 * n_samples)
+    left = np.maximum(0., frequencies - half_bin)
+    right = np.minimum(sfreq / 2, frequencies + half_bin)
+    weights = {}
     for band_name, (low, high) in bands.items():
         if not (0 < low < high < sfreq / 2):
             raise ValueError(f"Band {band_name!r} is outside the EEG Nyquist limit.")
-        mask = (frequencies >= low) & (frequencies < high)
-        if mask.sum() < 1:
+        if not np.any((frequencies >= low) & (frequencies < high)):
             raise ValueError(f"Epoch is too short to resolve band {band_name!r}.")
         token = safe_name(band_name)
-        if token in masks:
+        if token in weights:
             raise ValueError("EEG band names collide after sanitization.")
-        masks[token] = mask
-    return masks
+        weights[token] = np.maximum(0., np.minimum(right, high) - np.maximum(left, low))
+    return weights
 
 
 def eeg_features(epochs: np.ndarray, sfreq: float, channel_names: Sequence[str],
@@ -92,18 +95,7 @@ def eeg_features(epochs: np.ndarray, sfreq: float, channel_names: Sequence[str],
     if len(set(names)) != len(names):
         raise ValueError("EEG channel names collide after sanitization.")
     bands = EEG_BANDS if bands is None else bands
-    frequencies = np.fft.rfftfreq(x.shape[-1], d=1. / sfreq)
-    band_masks = {}
-    for band_name, (low, high) in bands.items():
-        if not (0 < low < high < sfreq / 2):
-            raise ValueError(f"Band {band_name!r} is outside the EEG Nyquist limit.")
-        mask = (frequencies >= low) & (frequencies < high)
-        if mask.sum() < 2:
-            raise ValueError(f"Epoch is too short to resolve band {band_name!r}.")
-        token = safe_name(band_name)
-        if token in band_masks:
-            raise ValueError("EEG band names collide after sanitization.")
-        band_masks[token] = mask
+    band_weights = _band_weights(x.shape[-1], bands, sfreq)
     # 子窗特征：位置相对于事件零点，因此需要 tmin。
     sub_specs = []
     if subwindows is not None:
@@ -114,9 +106,7 @@ def eeg_features(epochs: np.ndarray, sfreq: float, channel_names: Sequence[str],
             last = int(round((high - tmin) * sfreq))
             if first < 0 or last > x.shape[-1] or last - first < 8:
                 raise ValueError(f"Sub-window {label!r} falls outside the epoch.")
-            sub_freqs = np.fft.rfftfreq(last - first, d=1. / sfreq)
-            sub_specs.append((safe_name(label), first, last, sub_freqs,
-                              _band_masks(sub_freqs, bands, sfreq)))
+            sub_specs.append((safe_name(label), first, last, _band_weights(last - first, bands, sfreq)))
     output = {}
     for first in range(0, len(x), batch_size):
         last = min(first + batch_size, len(x))
@@ -128,21 +118,21 @@ def eeg_features(epochs: np.ndarray, sfreq: float, channel_names: Sequence[str],
         for j, name in enumerate(names):
             batch_features = {f"EEG_{name}_Std": batch[:, j].std(axis=-1),
                               f"EEG_{name}_PeakToPeak": np.ptp(batch[:, j], axis=-1)}
-            for band_name, mask in band_masks.items():
-                power = trapezoid(psd[:, j, mask], frequencies[mask], axis=-1)
+            for band_name, weights in band_weights.items():
+                power = psd[:, j, :] @ weights
                 batch_features[f"EEG_{name}_{band_name}_LogPower"] = np.log10(
                     np.maximum(power, np.finfo(float).tiny))
             for key, values in batch_features.items():
                 if key not in output:
                     output[key] = np.empty(len(x), dtype=float)
                 output[key][first:last] = values
-        for label, first_s, last_s, sub_freqs, masks in sub_specs:
+        for label, first_s, last_s, window_weights in sub_specs:
             segment = batch[:, :, first_s:last_s]
             _, sub_psd = welch(segment, fs=sfreq, nperseg=segment.shape[-1], axis=-1,
                                detrend="constant", scaling="density")
             for j, name in enumerate(names):
-                for band_name, mask in masks.items():
-                    power = trapezoid(sub_psd[:, j, mask], sub_freqs[mask], axis=-1)
+                for band_name, weights in window_weights.items():
+                    power = sub_psd[:, j, :] @ weights
                     key = f"EEG_{name}_SW{label}_{band_name}_LogPower"
                     if key not in output:
                         output[key] = np.empty(len(x), dtype=float)
@@ -224,13 +214,20 @@ def extract_features(dataset: TrialDataset, *, include_behavior: bool = False) -
     else:
         table = table.drop(columns=[c for c in table if c.startswith("Beh_")], errors="ignore")
     provenance = dict(dataset.provenance)
-    provenance["feature_extraction"] = {
-        "version": 2, "eeg": "named-channel amplitude, whole-window PSD, and 4 sub-window PSD statistics",
-        "eeg_subwindows_s": {key: list(value) for key, value in EEG_SUBWINDOWS.items()},
-        "physiology": "short-window amplitude statistics; no HRV/breathing-rate/SCR claims",
+    # Table-only imports keep their original EEG version and spectral provenance.
+    extraction = dict(provenance.get("feature_extraction", {}))
+    if dataset.epochs is not None:
+        extraction.update({
+            "version": 3, "eeg": "named-channel amplitude, whole-window PSD and four sub-window PSD statistics",
+            "eeg_band_power": "sum of one-sided Welch density times each frequency bin's overlap with the band (Hz)",
+            "eeg_bands_hz": {key: list(value) for key, value in EEG_BANDS.items()},
+            "eeg_subwindows_s": {key: list(value) for key, value in EEG_SUBWINDOWS.items()},
+            "eeg_feature_availability": "after full epoch; zero-phase filtering also uses future context",
+        })
+    extraction.update({
         "behavior_included": bool(include_behavior),
         "behavior_availability": "after all trial responses; not an early-detection predictor",
         "reaction_time_units": "unchanged source units; consult acquisition metadata",
-        "eeg_feature_availability": "after full epoch; zero-phase filtering also uses future context",
-    }
+    })
+    provenance["feature_extraction"] = extraction
     return replace(dataset, table=table, provenance=provenance)

@@ -3,8 +3,9 @@
 The dataset has many indistinguishably named Sync events per gambling trial.
 Trial_Datetime plus the first Sync is not sufficient to establish trial phase.
 Consequently preparation requires an externally checked alignment CSV containing
-Subject_ID, Trial_ID, EEG_Onset, Physio_Onset, and Event_Phase. EEG_Onset is seconds from the
-first EEG sample. Physio_Onset is seconds on the BIDS reference clock, where
+Subject_ID, Trial_ID, EEG_Onset, and Event_Phase. EEG_Onset is seconds from the
+first EEG sample. When physiology is requested, Physio_Onset is also required
+in seconds on the BIDS reference clock, where
 physiology row zero occurs at the JSON StartTime. The two onsets must refer to
 the same scientifically chosen trial phase. No timestamps are inferred or snapped.
 
@@ -29,7 +30,6 @@ from .features import extract_features, physiology_window_features, physiology_f
 
 
 LABELS = {"Probable_Truth": 0, "Probable_Lie": 1}
-ALIGNMENT_COLUMNS = ["Subject_ID", "Trial_ID", "EEG_Onset", "Physio_Onset", "Event_Phase"]
 FILTER_CONTEXT_SECONDS = 5.0
 LINE_NOISE_HZ = 50.0
 LINE_NOISE_Q = 30.0
@@ -84,11 +84,13 @@ def _behavior_table(path: str | Path) -> tuple[pd.DataFrame, list[dict]]:
                for row in table.loc[invalid].itertuples()]
     table = table.loc[~invalid].copy()
     table["Label"] = table["Label"].astype(int)
-    return table.reset_index(drop=True), dropped
+    # Rows in the original TSV can be shuffled; Trial_Order gives presentation order.
+    return table.sort_values("Trial_ID", key=pd.to_numeric).reset_index(drop=True), dropped
 
 
 def write_alignment_template(dataset_root: str | Path, output_csv: str | Path,
-                             subjects: Sequence[str] | None = None) -> pd.DataFrame:
+                             subjects: Sequence[str] | None = None, *,
+                             include_physiology: bool = False) -> pd.DataFrame:
     """Write original trial IDs and blank onset fields; never fabricate timing."""
     files = _recording_files(dataset_root, subjects)
     available = [f for f in files if _eeg_candidates(f)]
@@ -98,7 +100,8 @@ def write_alignment_template(dataset_root: str | Path, output_csv: str | Path,
     tables = [_behavior_table(f)[0] for f in files]
     template = pd.concat(tables, ignore_index=True)[["Subject_ID", "Trial_ID"]]
     template["EEG_Onset"] = np.nan
-    template["Physio_Onset"] = np.nan
+    if include_physiology:
+        template["Physio_Onset"] = np.nan
     template["Event_Phase"] = ""
     target = Path(output_csv)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -106,12 +109,15 @@ def write_alignment_template(dataset_root: str | Path, output_csv: str | Path,
     return template
 
 
-def validate_alignment(alignment: pd.DataFrame, trials: pd.DataFrame) -> pd.DataFrame:
+def validate_alignment(alignment: pd.DataFrame, trials: pd.DataFrame, *,
+                       include_physiology: bool = False) -> pd.DataFrame:
     """Validate a one-to-one join by original keys; keep behavior row order."""
-    missing = set(ALIGNMENT_COLUMNS) - set(alignment)
+    onsets = ["EEG_Onset", "Physio_Onset"] if include_physiology else ["EEG_Onset"]
+    columns = ["Subject_ID", "Trial_ID", *onsets, "Event_Phase"]
+    missing = set(columns) - set(alignment)
     if missing:
         raise ValueError(f"Alignment CSV lacks columns: {sorted(missing)}")
-    source = alignment[ALIGNMENT_COLUMNS].copy()
+    source = alignment[columns].copy()
     for name in ("Subject_ID", "Trial_ID"):
         if source[name].isna().any():
             raise ValueError(f"Alignment {name} contains blank identifiers.")
@@ -123,7 +129,7 @@ def validate_alignment(alignment: pd.DataFrame, trials: pd.DataFrame) -> pd.Data
         raise ValueError("Use one explicit Event_Phase across trials and subjects; do not mix trial-start and answer onsets.")
     if source.duplicated(["Subject_ID", "Trial_ID"]).any():
         raise ValueError("Alignment contains duplicate Subject_ID/Trial_ID pairs.")
-    for name in ("EEG_Onset", "Physio_Onset"):
+    for name in onsets:
         source[name] = pd.to_numeric(source[name], errors="coerce")
         if not np.isfinite(source[name]).all():
             raise ValueError(f"Alignment {name} must contain verified finite onsets, in seconds.")
@@ -138,7 +144,7 @@ def validate_alignment(alignment: pd.DataFrame, trials: pd.DataFrame) -> pd.Data
                          f"extra={sorted(actual_keys - expected_keys)[:5]}.")
     merged = expected.merge(source, on=["Subject_ID", "Trial_ID"], how="left", validate="one_to_one", sort=False)
     for subject, group in merged.groupby("Subject_ID", sort=False):
-        for name in ("EEG_Onset", "Physio_Onset"):
+        for name in onsets:
             if group[name].duplicated().any() or (np.diff(group[name]) <= 0).any():
                 raise ValueError(f"{subject}: {name} must increase in original trial order; review alignment.")
     return merged
@@ -217,12 +223,13 @@ def read_physiology_features(path: str | Path, metadata: dict, onsets: Sequence[
 def _eeg_metadata_channels(channels: pd.DataFrame) -> tuple[list[str], list[dict]]:
     if not {"name", "type"}.issubset(channels):
         raise ValueError("BIDS channels.tsv must supply channel names and types.")
-    if channels["name"].isna().any() or channels["name"].duplicated().any():
+    names = channels["name"].astype("string").str.strip()
+    if names.isna().any() or names.eq("").any() or names.duplicated().any():
         raise ValueError("BIDS channel names must be present and unique.")
     chosen, exclusions = [], []
     for row in channels.to_dict("records"):
         name = str(row["name"]).strip()
-        kind = str(row["type"]).upper()
+        kind = str(row["type"]).strip().upper()
         numbered = re.fullmatch(r"(?:EEG|CH|E)?[ _-]*(124|125)", name, flags=re.I)
         # Identify the documented EOG acquisition channel numbers by name; a
         # channel's position in a reordered table is not an anatomical identity.
@@ -230,7 +237,7 @@ def _eeg_metadata_channels(channels: pd.DataFrame) -> tuple[list[str], list[dict
         auxiliary = bool(NON_EEG_ACQUISITION.fullmatch(name))
         reason = ("non_EEG_type" if kind != "EEG" else "documented_EOG_124_125" if eye_channel else
                   "non_EEG_acquisition_channel" if auxiliary else
-                  "marked_bad" if str(row.get("status", "good")).lower() == "bad" else None)
+                  "marked_bad" if str(row.get("status", "good")).strip().lower() == "bad" else None)
         if reason:
             exclusions.append({"channel": name, "reason": reason})
         else:
@@ -302,18 +309,19 @@ def _eeg_candidates(behavior_path: Path) -> list[Path]:
             if (path := eeg_dir / f"{stem}_eeg{ext}").exists()]
 
 
-def _recording_paths(behavior_path: Path) -> dict:
+def _recording_paths(behavior_path: Path, *, include_physiology: bool) -> dict:
     stem = behavior_path.name.removesuffix("_beh.tsv")
     eeg_dir = behavior_path.parent.parent / "eeg"
     eeg_files = _eeg_candidates(behavior_path)
     if len(eeg_files) != 1:
         raise FileNotFoundError(f"{stem}: expected one raw EDF/BDF/VHDR/FIF EEG recording, found {len(eeg_files)}.")
     paths = {"eeg": eeg_files[0], "channels": eeg_dir / f"{stem}_channels.tsv",
-             "eeg_json": eeg_dir / f"{stem}_eeg.json", "events": eeg_dir / f"{stem}_events.tsv",
-             "physio": behavior_path.parent / f"{stem}_physio.tsv.gz",
-             "physio_json": behavior_path.parent / f"{stem}_physio.json"}
-    if not paths["physio"].exists():
-        paths["physio"] = behavior_path.parent / f"{stem}_physio.tsv"
+             "eeg_json": eeg_dir / f"{stem}_eeg.json", "events": eeg_dir / f"{stem}_events.tsv"}
+    if include_physiology:
+        paths["physio_json"] = behavior_path.parent / f"{stem}_physio.json"
+        paths["physio"] = behavior_path.parent / f"{stem}_physio.tsv.gz"
+        if not paths["physio"].exists():
+            paths["physio"] = behavior_path.parent / f"{stem}_physio.tsv"
     for key, path in paths.items():
         if not path.exists():
             raise FileNotFoundError(f"Required raw recording/metadata file missing ({key}): {path}")
@@ -335,8 +343,8 @@ def prepare_dataset(dataset_root: str | Path, output_dir: str | Path,
                     alignment_csv: str | Path | None, *, tmin: float = -.2,
                     tmax: float = 1.5, target_sfreq: float = 256.,
                     subjects: Sequence[str] | None = None,
-                    include_behavior: bool = False) -> TrialDataset:
-    """Prepare keyed EEG/physiology data, extract safe features, and save a bundle.
+                    include_behavior: bool = False, include_physiology: bool = False) -> TrialDataset:
+    """Prepare keyed EEG trials, optionally adding physiology, and save a bundle.
 
     An alignment file is mandatory. Its onsets are treated as user-supplied,
     externally verified mappings, not automatically verified ground truth.
@@ -372,7 +380,7 @@ def prepare_dataset(dataset_root: str | Path, output_dir: str | Path,
         behavior_files = available
     if alignment_csv is None:
         template_path = output / "alignment_template.csv"
-        write_alignment_template(dataset_root, template_path, subjects)
+        write_alignment_template(dataset_root, template_path, subjects, include_physiology=include_physiology)
         raise AlignmentRequiredError(f"Supply checked per-trial onsets using {template_path}; no Sync-to-trial mapping was assumed.")
     alignment = pd.read_csv(alignment_csv, dtype={"Subject_ID": str, "Trial_ID": str})
     # Rows for known absent recordings cannot be meaningfully aligned. All other
@@ -382,12 +390,12 @@ def prepare_dataset(dataset_root: str | Path, output_dir: str | Path,
     if subjects is not None:
         selected_ids = set(trials["Subject_ID"])
         alignment = alignment.loc[alignment["Subject_ID"].isin(selected_ids)].copy()
-    alignment = validate_alignment(alignment, trials)
+    alignment = validate_alignment(alignment, trials, include_physiology=include_physiology)
     paths_by_subject, names_by_subject, excluded_channels = {}, {}, {}
     for behavior in behavior_files:
         subject = behavior.parents[2].name
-        paths = _recording_paths(behavior)
-        channels = pd.read_csv(paths["channels"], sep="\t", encoding="utf-8-sig")
+        paths = _recording_paths(behavior, include_physiology=include_physiology)
+        channels = pd.read_csv(paths["channels"], sep="\t", encoding="utf-8-sig", dtype={"name": str})
         names, exclusions = _eeg_metadata_channels(channels)
         paths_by_subject[subject], names_by_subject[subject] = paths, names
         excluded_channels[subject] = exclusions
@@ -404,7 +412,6 @@ def prepare_dataset(dataset_root: str | Path, output_dir: str | Path,
         row_ids = np.flatnonzero(trials["Subject_ID"].to_numpy() == subject)
         subject_trials = trials.iloc[row_ids].reset_index(drop=True)
         subject_alignment = alignment.iloc[row_ids].reset_index(drop=True)
-        physio_metadata = _read_physio_metadata(paths["physio_json"])
         distances = _event_distances(paths["events"], subject_alignment["EEG_Onset"])
         eeg_metadata = json.loads(paths["eeg_json"].read_text(encoding="utf-8-sig"))
         raw = _read_raw(paths["eeg"])
@@ -439,35 +446,40 @@ def prepare_dataset(dataset_root: str | Path, output_dir: str | Path,
                 all_epochs.append(epoch)
             kept = subject_trials.iloc[retained].reset_index(drop=True)
             kept["EEG_Onset"] = subject_alignment.iloc[retained]["EEG_Onset"].to_numpy()
-            kept["Physio_Onset"] = subject_alignment.iloc[retained]["Physio_Onset"].to_numpy()
             kept["QC_EEG_OnsetQuantization_s"] = errors
             kept["QC_EEG_ActualEventOnset_s"] = kept["EEG_Onset"] + np.asarray(errors)
             kept["QC_EEG_ActualWindowStart_s"] = kept["QC_EEG_ActualEventOnset_s"] + actual_tmin
             kept["QC_EEG_ActualWindowEnd_s"] = kept["QC_EEG_ActualEventOnset_s"] + actual_tmax
             kept["QC_EEG_NearestEventDistance_s"] = distances[retained]
-            # Match the actual EEG relative window, including its tiny event-grid
-            # shift, then quantize physiology endpoints on their own sample grid.
-            phys_features = read_physiology_features(paths["physio"], physio_metadata,
-                kept["Physio_Onset"].to_numpy() + np.asarray(errors), actual_tmin, actual_tmax)
-            kept = pd.concat([kept, phys_features], axis=1)
-            retained_tables.append(kept)
             recording_qc[subject] = {
-                "original_eeg_sfreq": sfreq, "physiology_sfreq": physio_metadata["SamplingFrequency"],
-                "physiology_start_time": physio_metadata["StartTime"],
-                "physiology_columns": physio_metadata["Columns"],
-                "physiology_unmodeled_columns": [c for c in physio_metadata["Columns"] if physiology_feature_prefix(c) is None],
+                "original_eeg_sfreq": sfreq,
                 "retained_trials": len(retained), "source_trials": len(subject_trials),
-                "physiology_status": dict(Counter(kept["QC_Physio_Status"])),
                 "source_files": {key: str(value) for key, value in paths.items()},
-                "source_metadata_sha256": {key: file_sha256(paths[key])
-                    for key in ("channels", "events", "eeg_json", "physio_json")},
+                "source_metadata_sha256": {key: file_sha256(path) for key, path in paths.items()
+                                           if key in ("channels", "events", "eeg_json", "physio_json")},
                 "behavior_sha256": file_sha256(behavior_by_subject[subject]),
                 "behavior_file": str(behavior_by_subject[subject].resolve()),
                 "raw_recordings": {key: {"path": str(paths[key].resolve()),
                     "size_bytes": paths[key].stat().st_size, "sha256": None,
                     "hash_status": "not computed; large raw recordings are identified by path/size only"}
-                    for key in ("eeg", "physio")},
+                    for key in paths if key in ("eeg", "physio")},
             }
+            if include_physiology:
+                metadata = _read_physio_metadata(paths["physio_json"])
+                kept["Physio_Onset"] = subject_alignment.iloc[retained]["Physio_Onset"].to_numpy()
+                phys_features = read_physiology_features(
+                    paths["physio"], metadata, kept["Physio_Onset"].to_numpy() + np.asarray(errors),
+                    actual_tmin, actual_tmax,
+                )
+                kept = pd.concat([kept, phys_features], axis=1)
+                recording_qc[subject].update({
+                    "physiology_sfreq": metadata["SamplingFrequency"],
+                    "physiology_start_time": metadata["StartTime"],
+                    "physiology_columns": metadata["Columns"],
+                    "physiology_unmodeled_columns": [c for c in metadata["Columns"] if physiology_feature_prefix(c) is None],
+                    "physiology_status": dict(Counter(kept["QC_Physio_Status"])),
+                })
+            retained_tables.append(kept)
         finally:
             raw.close()
     output.mkdir(parents=True, exist_ok=True)
@@ -485,13 +497,15 @@ def prepare_dataset(dataset_root: str | Path, output_dir: str | Path,
                                   for path in behavior_by_subject.values()},
         "alignment_verification": "explicit externally checked user mappings; not inferred from Sync markers",
         "event_phase": str(alignment["Event_Phase"].iloc[0]),
-        "onset_units": "seconds; EEG relative sample0; physiology reference clock uses JSON StartTime",
+        "include_physiology": include_physiology,
+        "onset_units": "seconds from EEG sample zero",
         "eeg_filter": {"kind": "4th-order Butterworth zero-phase", "passband_hz": [1., 45.],
                        "context_seconds_each_side": FILTER_CONTEXT_SECONDS,
+                       "notch_if_below_source_nyquist_hz": LINE_NOISE_HZ, "notch_q": LINE_NOISE_Q,
                        "resampling": "polyphase FIR antialiasing"},
         "requested_window": [tmin, tmax], "actual_eeg_window": [actual_tmin, actual_tmax],
-        "window_alignment": "physiology endpoints use actual EEG relative window and event-grid shift; endpoint grid errors are recorded per trial",
-        "channel_units": "volts as read by MNE; physiology source units from JSON",
+        "window_alignment": "checked EEG onset quantized to the recording and resampling grids",
+        "channel_units": "EEG volts as read by MNE",
         "excluded_channels": excluded_channels,
         "subjects_excluded_missing_EEG": excluded_subjects,
         "dropped_trials": dropped, "recordings": recording_qc,
@@ -499,6 +513,10 @@ def prepare_dataset(dataset_root: str | Path, output_dir: str | Path,
         "sources": ["https://github.com/OpenNeuroDatasets/ds004511/blob/main/README",
                     "https://github.com/OpenNeuroDatasets/ds004511/tree/main/sub-S200116/ses-01/eeg"],
     }
+    if include_physiology:
+        provenance["onset_units"] += "; Physio_Onset uses the BIDS reference clock and JSON StartTime"
+        provenance["window_alignment"] += "; physiology endpoints match the EEG window and event-grid shift"
+        provenance["channel_units"] += "; physiology source units from JSON"
     dataset = TrialDataset(table=pd.concat(retained_tables, ignore_index=True), epochs=np.stack(all_epochs),
                            sfreq=float(target_sfreq), tmin=float(actual_tmin),
                            channel_names=channel_names, provenance=provenance)

@@ -26,8 +26,9 @@ def _scores(frame: pd.DataFrame) -> dict[str, Any]:
     }
     if len(y):
         result.update(accuracy=float(accuracy_score(y, predicted)),
-                      balanced_accuracy=float(balanced_accuracy_score(y, predicted)),
                       f1_macro=float(f1_score(y, predicted, labels=[0, 1], average="macro", zero_division=0)))
+        if np.unique(y).size == 2:
+            result["balanced_accuracy"] = float(balanced_accuracy_score(y, predicted))
     if "Probability" in frame:
         probabilities = pd.to_numeric(frame.Probability, errors="raise")
         usable = successful & probabilities.notna()
@@ -75,18 +76,69 @@ def summarize_predictions(predictions: pd.DataFrame) -> dict[str, Any]:
         accuracies = [row["accuracy"] for row in by_subject if row["accuracy"] is not None]
         summary["mean_subject_accuracy"] = float(np.mean(accuracies)) if accuracies else None
         summary["std_subject_accuracy"] = float(np.std(accuracies, ddof=1)) if len(accuracies) > 1 else None
+        balanced = [row["balanced_accuracy"] for row in by_subject if row["balanced_accuracy"] is not None]
+        summary["subjects_with_both_scored_classes"] = len(balanced)
+        summary["mean_subject_balanced_accuracy"] = float(np.mean(balanced)) if balanced else None
         models.append(summary)
     return {
         "metric_definitions": {
             "accuracy": "Pooled fraction of successful predictions that are correct.",
-            "balanced_accuracy": "Mean recall of the classes present in the evaluated rows.",
+            "balanced_accuracy": "Mean of the two class recalls on scored trials. Undefined if either label is absent.",
             "f1_macro": "Pooled macro F1 over labels 0 and 1, zero_division=0.",
             "roc_auc": "Pooled AUC on successful rows with actual predicted probabilities; null if unavailable.",
             "coverage": "Successful predictions divided by attempted predictions; always report with scores.",
             "mean_subject_accuracy": "Unweighted mean of each held-out participant's accuracy.",
+            "mean_subject_balanced_accuracy": "Unweighted mean across participants with both labels among scored trials.",
         },
         "models": models,
     }
+
+
+def paired_agfl_comparisons(predictions: pd.DataFrame, reference="none",
+                            configs=None) -> tuple[pd.DataFrame, list[dict]]:
+    """Compare selected arms to the reference at the same seeds and out-of-fold trials."""
+    keys = ["Seed", "Fold", *ID_COLUMNS]
+    records, comparisons = [], []
+    for feature_set, run in predictions.groupby("Feature_Set", sort=True):
+        baseline = run.loc[run.Config == reference, [*keys, "Label", "Prediction"]]
+        if baseline.empty:
+            continue
+        compared = run.Config.ne(reference) if configs is None else run.Config.isin(configs)
+        for config, graph in run.loc[compared].groupby("Config", sort=True):
+            pairs = baseline.merge(graph[[*keys, "Label", "Prediction"]], on=keys,
+                                   how="outer", validate="one_to_one", indicator=True,
+                                   suffixes=("_base", "_graph"))
+            if not pairs["_merge"].eq("both").all() or not pairs.Label_base.eq(pairs.Label_graph).all():
+                raise ValueError("AGFL comparisons require identical trials, labels, seeds and test folds.")
+            subject_deltas = []
+            for subject, subject_trials in pairs.groupby("Subject_ID", sort=True):
+                seed_deltas = []
+                for seed, trials in subject_trials.groupby("Seed", sort=True):
+                    valid = trials.Prediction_base.notna() & trials.Prediction_graph.notna()
+                    y = trials.Label_base
+                    base = graph_score = delta = None
+                    if valid.all() and y.nunique() == 2:
+                        base = float(balanced_accuracy_score(y, trials.Prediction_base))
+                        graph_score = float(balanced_accuracy_score(y, trials.Prediction_graph))
+                        delta = graph_score - base
+                        seed_deltas.append(delta)
+                    records.append({
+                        "Feature_Set": feature_set, "Reference": reference, "Config": config, "Seed": int(seed),
+                        "Subject_ID": subject, "Trials": len(trials), "Paired_Predictions": int(valid.sum()),
+                        "Class_0": int(y.eq(0).sum()), "Class_1": int(y.eq(1).sum()),
+                        "Baseline_Balanced_Accuracy": base, "Graph_Balanced_Accuracy": graph_score,
+                        "Delta_Balanced_Accuracy": delta,
+                    })
+                if len(seed_deltas) == subject_trials.Seed.nunique():
+                    subject_deltas.append(float(np.mean(seed_deltas)))
+            comparisons.append({
+                "feature_set": feature_set, "baseline": reference, "config": config,
+                "participants_total": int(pairs.Subject_ID.nunique()),
+                "participants_scored": len(subject_deltas),
+                "mean_paired_balanced_accuracy_difference": (
+                    float(np.mean(subject_deltas)) if subject_deltas else None),
+            })
+    return pd.DataFrame.from_records(records), comparisons
 
 
 def write_run(result: dict[str, Any], dataset: TrialDataset, output_dir: str | Path,
@@ -109,6 +161,20 @@ def write_run(result: dict[str, Any], dataset: TrialDataset, output_dir: str | P
     if len(attempted) != len(dataset.table) and not result.get("diagnostic", False):
         raise ValueError("The run omitted trials without declaring an explicit diagnostic sample.")
     summary["sampling_fraction"] = len(attempted) / len(dataset.table)
+    if configuration.get("command") in ("agfl", "eegnet"):
+        paired, comparisons = paired_agfl_comparisons(predictions)
+        if configuration["command"] == "eegnet":
+            hop_pairs, hop_comparisons = paired_agfl_comparisons(predictions, reference="k0", configs=["inter"])
+            paired = pd.concat([paired, hop_pairs], ignore_index=True)
+            comparisons.extend(hop_comparisons)
+        summary["paired_comparisons"] = comparisons
+        if not paired.empty:
+            result = {**result, "paired_comparisons": paired}
+            summary["metric_definitions"]["mean_paired_balanced_accuracy_difference"] = (
+                "Compared configuration minus reference balanced accuracy on identical trials, averaged first across seeds "
+                "within participant and then equally across participants. Requires both labels and complete "
+                "paired predictions for every seed of the participant."
+            )
     output.mkdir(parents=True, exist_ok=True)
     artifacts = {}
     for name, value in result.items():

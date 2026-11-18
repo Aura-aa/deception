@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 
 from .data import audit_table, feature_columns, load_bundle, load_legacy_table, require_evaluable, save_bundle
 from .metrics import write_run
 
-_AGFL_CONFIG: dict = {}
 
-
-def _input_options(parser):
-    parser.add_argument("--input", type=Path, required=True, help="Prepared bundle directory or original CSV for diagnostics.")
+def _input_options(parser, *, waveform=False):
+    input_help = ("Prepared bundle directory containing aligned EEG epochs." if waveform else
+                  "Prepared bundle directory or original CSV for diagnostics.")
+    parser.add_argument("--input", type=Path, required=True, help=input_help)
     parser.add_argument("--output", type=Path, required=True, help="New output directory; existing results are preserved.")
     parser.add_argument("--allow-unverified", action="store_true", help="Explicit diagnostic mode for legacy feature tables.")
     parser.add_argument("--allow-synthetic", action="store_true", help="Allow clearly labeled synthetic software controls.")
@@ -29,6 +30,26 @@ def _classical_options(parser):
     parser.add_argument("--n-jobs", type=int, default=1)
 
 
+def _graph_options(parser, *, weight_decay, waveform=False):
+    _input_options(parser, waveform=waveform)
+    parser.add_argument("--grouping", choices=["loso", "within"], default="loso",
+                        help="Hold out a participant by default. within is a fixed-epoch, same-person experiment.")
+    parser.add_argument("--seeds", nargs="+", type=int, default=[2026])
+    parser.add_argument("--a", type=int, default=16)
+    parser.add_argument("--hops", type=int, default=2)
+    parser.add_argument("--kappa", type=int, default=5)
+    duration = parser.add_mutually_exclusive_group()
+    duration.add_argument("--epochs", type=int, help="Use a prespecified fixed training length and skip epoch selection.")
+    duration.add_argument("--validation-epochs", nargs="+", type=int, metavar="N",
+                          help="Select training length in inner participant validation (LOSO default: 20 40 60).")
+    parser.add_argument("--inner-splits", type=int, default=3,
+                        help="Number of grouped validation folds among the outer training participants.")
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=weight_decay)
+    parser.add_argument("--shuffle-labels", action="store_true")
+    parser.add_argument("--n-threads", type=int, default=4)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -36,7 +57,8 @@ def build_parser():
     template.add_argument("--dataset-root", type=Path, required=True)
     template.add_argument("--output", type=Path, required=True, help="Output CSV file.")
     template.add_argument("--subjects", nargs="+")
-    prepare = commands.add_parser("prepare", help="Prepare EEG and physiology from raw ds004511 using checked trial mappings.")
+    template.add_argument("--include-physiology", action="store_true", help="Include an onset column for the physiology recording.")
+    prepare = commands.add_parser("prepare", help="Prepare EEG from raw ds004511 using checked trial mappings.")
     prepare.add_argument("--dataset-root", type=Path, required=True)
     prepare.add_argument("--alignment", type=Path, help="Checked Subject_ID/Trial_ID/onset/Event_Phase CSV.")
     prepare.add_argument("--output", type=Path, required=True)
@@ -44,6 +66,7 @@ def build_parser():
     prepare.add_argument("--tmin", type=float, default=-.2)
     prepare.add_argument("--tmax", type=float, default=1.5)
     prepare.add_argument("--sfreq", type=float, default=256.)
+    prepare.add_argument("--include-physiology", action="store_true", help="Also extract recorded physiology, including EMG, using checked physiology onsets.")
     prepare.add_argument("--include-behavior", action="store_true", help="Include RT predictors available after all trial responses.")
     features = commands.add_parser("features", help="Re-extract features from an aligned bundle.")
     features.add_argument("--input", type=Path, required=True)
@@ -69,20 +92,20 @@ def build_parser():
     benchmark.add_argument("--equal-width-vectors", action="store_true",
                            help="Pad narrow groups (physiology) to the common width; EEG groups use PCA.")
     agfl = commands.add_parser("agfl", help="AGFL layer comparison: none / k0 / intra / inter / combined.")
-    _input_options(agfl)
-    agfl.add_argument("--grouping", choices=["loso", "within"], default="within")
-    agfl.add_argument("--configs", nargs="+", default=["none", "k0", "intra", "inter", "combined"],
-                      choices=["none", "k0", "intra", "inter", "combined"])
-    agfl.add_argument("--seeds", nargs="+", type=int, default=[2026])
+    _graph_options(agfl, weight_decay=1e-2)
+    agfl.add_argument("--input-mode", choices=["eeg", "eeg_emg", "eeg_physiology"], default="eeg",
+                      help="Use EEG alone by default, add EMG, or include all recorded physiology groups.")
+    agfl.add_argument("--configs", nargs="+", default=["none", "inter"],
+                      choices=["none", "k0", "intra", "inter", "combined"],
+                      help="Compare the baseline (none) with a graph over all selected nodes (inter) by default.")
     agfl.add_argument("--d", type=int, default=16)
-    agfl.add_argument("--a", type=int, default=16)
-    agfl.add_argument("--hops", type=int, default=2)
-    agfl.add_argument("--kappa", type=int, default=5)
-    agfl.add_argument("--epochs", type=int, default=60)
-    agfl.add_argument("--lr", type=float, default=1e-3)
-    agfl.add_argument("--weight-decay", type=float, default=1e-2)
-    agfl.add_argument("--shuffle-labels", action="store_true")
-    agfl.add_argument("--n-threads", type=int, default=4)
+    eegnet = commands.add_parser("eegnet", help="Compare EEGNet and its AGFL variants on aligned EEG waveforms.")
+    _graph_options(eegnet, weight_decay=0., waveform=True)
+    eegnet.set_defaults(input_mode="eeg", d=16)
+    eegnet.add_argument("--configs", choices=["none", "inter", "k0"], nargs="+", default=["none", "inter", "k0"],
+                        help="Compare plain EEGNet, graph propagation, and the zero-hop control.")
+    eegnet.add_argument("--batch-size", type=int, default=32)
+    eegnet.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     spatial = commands.add_parser("spatial", help="CSP or xDAWN fitted independently in every training fold.")
     _input_options(spatial)
     _classical_options(spatial)
@@ -154,7 +177,8 @@ def run(args):
         from .preparation import write_alignment_template
         if args.output.exists():
             raise ValueError("The alignment output already exists; preserve checked mappings by using a new path.")
-        table = write_alignment_template(args.dataset_root, args.output, args.subjects)
+        table = write_alignment_template(args.dataset_root, args.output, args.subjects,
+                                         include_physiology=args.include_physiology)
         print(f"Wrote {len(table)} trial IDs to {args.output}; verified onsets and event phase must be supplied.")
         return
     if args.command == "prepare":
@@ -162,7 +186,8 @@ def run(args):
         _new_directory(args.output)
         data = prepare_dataset(args.dataset_root, args.output, args.alignment,
                                tmin=args.tmin, tmax=args.tmax, target_sfreq=args.sfreq,
-                               subjects=args.subjects, include_behavior=args.include_behavior)
+                               subjects=args.subjects, include_behavior=args.include_behavior,
+                               include_physiology=args.include_physiology)
         print(f"Prepared {len(data.table)} aligned trials from {data.table.Subject_ID.nunique()} participants: {args.output}")
         return
     if args.command == "mock":
@@ -172,6 +197,8 @@ def run(args):
                                  signal=not args.noise_only), args.output)
         print(f"Synthetic software control saved: {args.output}")
         return
+    if args.command == "eegnet" and not args.input.is_dir():
+        raise ValueError("EEGNet needs a prepared bundle directory containing trials.csv, metadata.json and epochs.npy.")
     data = _load(args.input)
     if args.command == "audit":
         result = json.dumps(audit_table(data), indent=2, allow_nan=False)
@@ -203,25 +230,22 @@ def run(args):
                                     vector_groups=args.vector_groups,
                                     vector_width=args.vector_width,
                                     equal_width=args.equal_width_vectors)
-    elif args.command == "agfl":
+    elif args.command in ("agfl", "eegnet"):
+        if args.command == "eegnet" and args.device == "cuda":
+            # cuBLAS reads this at initialization for deterministic matrix multiplies.
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         from .torch_benchmark import evaluate_agfl
-        result = evaluate_agfl(data, grouping=args.grouping, configs=tuple(args.configs),
+        backbone_options = {}
+        if args.command == "eegnet":
+            backbone_options = {"backbone": "eegnet", "batch_size": args.batch_size, "device": args.device}
+        result = evaluate_agfl(data, input_mode=args.input_mode, grouping=args.grouping,
+                               configs=tuple(args.configs), inner_splits=args.inner_splits,
+                               validation_epochs=args.validation_epochs,
                                seeds=tuple(args.seeds), d=args.d, a=args.a, hops=args.hops,
                                kappa=args.kappa, epochs=args.epochs, lr=args.lr,
                                weight_decay=args.weight_decay,
                                shuffle_labels=args.shuffle_labels,
-                               fold_seed=args.seed, n_threads=args.n_threads)
-        args.output.mkdir(parents=True, exist_ok=True)
-        _AGFL_CONFIG.clear()
-        _AGFL_CONFIG.update({
-            "configs": list(args.configs), "seeds": list(args.seeds),
-            "d": args.d, "a": args.a, "hops": args.hops, "kappa": args.kappa,
-            "epochs": args.epochs, "lr": args.lr, "weight_decay": args.weight_decay,
-            "grouping": args.grouping, "fold_seed": args.seed,
-            "shuffle_labels": bool(args.shuffle_labels),
-            "encoder": "training-fold StandardScaler + PCA(d) for wide groups, zero padding for narrow groups",
-            "pca4": "0.95 fitted on training-fold encoder output; AGFL output uses the same basis",
-        })
+                               fold_seed=args.seed, n_threads=args.n_threads, **backbone_options)
     elif args.command == "spatial":
         from .evaluation import evaluate_spatial
         result = evaluate_spatial(data, representation=args.representation, models=tuple(args.models),
@@ -247,10 +271,9 @@ def run(args):
         raise ValueError("Unknown command.")
     configuration = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     write_run(result, data, args.output, configuration=configuration, run_status=status)
-    if _AGFL_CONFIG:
-        (args.output / "agfl_config.json").write_text(
-            json.dumps(_AGFL_CONFIG, indent=2, ensure_ascii=False), encoding="utf-8")
-        _AGFL_CONFIG.clear()
+    if args.command in ("agfl", "eegnet"):
+        (args.output / f"{args.command}_config.json").write_text(
+            json.dumps(result["configuration"], indent=2, allow_nan=False), encoding="utf-8")
     print(f"Saved predictions, metrics, fold selections and run metadata: {args.output}")
 
 
